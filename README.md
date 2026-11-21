@@ -1,83 +1,80 @@
 # agent-skills-updater
 
-Keep a vendored collection of agent skills (`SKILL.md` folders for Claude Code, OpenCode, Codex, Cursor and others) up to date with their upstream repositories, without letting third-party code onto your machine unreviewed.
+Keep the agent skills you have installed up to date, whichever skills those are.
 
-It works in two steps, with a pull request between them:
+It finds every skill folder (a folder with `SKILL.md`) that Claude Code, OpenCode, Codex, Cursor, Gemini CLI or Copilot can see, works out which GitHub repository each one came from, and updates them from there. There is no list to maintain: it adapts to whatever you have installed.
 
-1. **Upstream → pull request.** A weekly GitHub Action fetches every upstream you track, refreshes the skills that changed, and opens one pull request. Its description lists new or changed scripts first, links each upstream compare view, and names any new upstream skills it did not add.
-2. **Merged → your machine.** A daily systemd user timer pulls your merged branch and installs it into `~/.agents/skills`, linking new skills into `~/.claude/skills`. It never overwrites a skill you edited locally.
+One Python file, standard library only. It needs `git`. `gh` or a `GITHUB_TOKEN` is optional but improves source detection.
 
-Standard library Python 3 and Bash only. No dependencies, no API keys.
+## Install
 
-## Expected layout
-
-The tools run inside your own skills repository:
-
-```text
-your-skills-repo/
-  skills/<name>/SKILL.md        # one folder per skill
-  sources/tracked.json          # where each skill comes from (generated below)
-  sources/removed-skills.json   # optional: skills you never want back
-  tools/                        # copied from this repo
-  .github/workflows/update-skills.yml
+```bash
+git clone https://github.com/choonhows/agent-skills-updater.git
+cd agent-skills-updater && ./install.sh
 ```
 
-## Setup
+This puts `agent-skills-updater` in `~/.local/bin`. On Linux with systemd it also enables a daily timer (`--no-timer` to skip, `--uninstall` to remove). On other systems, run `python3 agent_skills_updater.py` directly or schedule it with cron or launchd.
 
-1. Copy `tools/` and `.github/workflows/update-skills.yml` into your skills repository.
-2. Generate `sources/tracked.json` from the upstreams your skills came from:
+## Use
 
-   ```bash
-   python3 tools/discover_sources.py emilkowalski/skills cloudflare/security-audit-skill --write
-   ```
+```bash
+agent-skills-updater scan      # list your skills and where each one comes from
+agent-skills-updater check     # what's out of date (exit code 10 if anything is)
+agent-skills-updater update    # show the changes, ask, then apply them
+```
 
-   It matches each local skill to the closest upstream folder and reports skills that more than one upstream claims and skills no upstream claims. Then edit the file:
-   - `"mode": "report"` for a source whose skills you changed locally, so updates are listed rather than applied.
-   - `"report_new_skills": true` for bundles where you want to hear about skills you don't have yet.
-   - `"exclude"` for upstream files you deliberately left out.
+Run `update` yourself the first time. After that, the timer keeps things current.
 
-   See [`examples/tracked.json`](examples/tracked.json).
-3. Optional: add `sources/removed-skills.json` (see [`examples/removed-skills.json`](examples/removed-skills.json)) for skills you removed and never want restored.
-4. Check that it works without changing anything:
-
-   ```bash
-   python3 tools/update_skills.py --dry-run
-   ```
-
-5. In your repository on GitHub, go to **Settings → Actions → General → Workflow permissions** and tick **Allow GitHub Actions to create and approve pull requests**. Otherwise the workflow can't open its pull request.
-6. On each machine (Linux with systemd):
-
-   ```bash
-   tools/install-sync-timer.sh https://github.com/you/your-skills-repo.git
-   agent-skills-sync --dry-run
-   ```
-
-   On the first run, add `--adopt` once if your installed copies are older than the repository's. Logs are in `journalctl --user -u agent-skills-sync`. Remove with `tools/install-sync-timer.sh --uninstall`.
-
-## Safety model
-
-- **Nothing lands unreviewed.** Upstream changes only ever reach a pull request. The sync installs only what you merged.
-- **Scripts first.** The pull request lists every new or changed script or binary at the top.
-- **No symlinks.** Upstream symlinks are skipped and reported, never copied.
-- **Removed means removed.** Skills in `removed-skills.json` are never refreshed or re-added.
-- **New skills are opt-in.** New upstream skills are reported, not added. Map one in `tracked.json` to start tracking it.
-- **Your edits win.** The sync skips any installed skill that no longer matches the previous repository version, and any skill whose `~/.claude/skills` entry points somewhere else, such as a development checkout. Skills that exist only on your machine are never touched.
-- **Removals propagate carefully.** A skill deleted from the repository and listed in `removed-skills.json` is uninstalled only if your copy is unedited.
-
-## Configuration
-
-`tools/sync-local.sh` reads its settings from the environment or from `~/.config/agent-skills-sync.env`:
-
-| Variable | Default |
+| Command | What it does |
 | --- | --- |
-| `SKILLS_REPO_URL` | required |
-| `SKILLS_BRANCH` | `main` |
-| `SKILLS_CLONE` | `~/.local/share/agent-skills` |
-| `SKILLS_TARGET` | `~/.agents/skills` |
-| `SKILLS_LINKS` | `~/.claude/skills` |
+| `scan [--refresh]` | Detect sources. Results are saved, so later runs only look up new skills. |
+| `check [NAME ...] [--report FILE]` | Compare installed skills with upstream. |
+| `update [NAME ...]` | Apply updates. `--yes` skips the prompt, `--safe` skips updates that add or change scripts, `--only-known` skips skills with no recorded baseline, `--force` also overwrites skills you edited, `--dry-run` changes nothing, `--notify` sends a desktop notification. |
+| `pin NAME OWNER/REPO[:PATH]` | Set a skill's source by hand when detection misses it or picks the wrong one. |
+| `ignore NAME` / `unignore NAME` | Never update a skill, or start again. |
 
-The workflow runs Mondays at 02:00 UTC. Change the `cron` line to run it at another time, or start it by hand from the Actions tab.
+Global options: `--dir PATH` (repeatable) to manage specific folders instead of the usual locations, `--state FILE`, and `--no-search`.
+
+## Where it looks
+
+`~/.claude/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, `~/.opencode/skills`, `~/.codex/skills`, `~/.cursor/skills`, `~/.gemini/skills` and `~/.copilot/skills`. Symlinked skills are counted once. Folders that hold several skills (a cloned bundle) are searched one level down.
+
+## How it finds a skill's source
+
+It tries these in order and stops at the first one that confirms by comparing file contents (at least a 60% match):
+
+1. **A git checkout.** If the skill lives inside its own clone, the updater reports it and leaves it to `git pull`.
+2. **The `npx skills` lock file** (`~/.agents/.skill-lock.json`).
+3. **GitHub links** in the `SKILL.md` frontmatter.
+4. **Repositories it already knows.** Skills usually come in bundles, so one identified skill often places dozens of others.
+5. **The [skills.sh](https://skills.sh) directory**, ranked by installs. This puts originals ahead of copies.
+6. **GitHub search:** first repositories named after the skill, ranked by stars, then code search on a phrase from its description.
+
+If none of these confirm a match, the skill is marked unknown. Use `pin` to set its source.
+
+To look skills up, it sends their names, and a phrase from their description, to skills.sh and GitHub. Nothing else about your machine leaves it.
+
+## Safety
+
+- **Edits are kept.** After each update it records a hash of the installed skill. A skill you changed afterwards is reported as "edited locally" and left alone unless you pass `--force`.
+- **First-time differences need you.** With no baseline yet, it can't tell an outdated skill from an edited one. It reports these as "differs", and only an update you confirm (or `--yes`) applies them. The timer passes `--only-known`, so it never touches them.
+- **Scripts are reviewed.** Every update lists new or changed scripts and executables first. The timer passes `--safe`, so those updates always wait for you.
+- **Backups.** Every update is copied to `~/.cache/agent-skills-updater/backups/<time>/` first.
+- **No symlinks or extras.** Upstream symlinks are never copied, and nothing outside the skill folder is touched.
+- **New upstream skills are never added**, only the ones you already have are updated.
+
+State lives in `~/.config/agent-skills-updater/state.json`, and the upstream clone cache in `~/.cache/agent-skills-updater/repos/`.
+
+## A skills repository in CI
+
+To keep a repository that vendors skills under `skills/` current through pull requests, run a scan locally once and commit the state file:
+
+```bash
+python3 agent_skills_updater.py --dir skills --state .skills-updater.json scan
+```
+
+Then copy [`examples/update-skills.yml`](examples/update-skills.yml) into `.github/workflows/`. It opens a weekly pull request with the changes and the scripts to review.
 
 ## License
 
-[MIT](LICENSE). Skills you vendor keep their own licenses. Check that you may redistribute a skill before publishing a collection that contains it.
+[MIT](LICENSE). Skills keep their own licenses. This tool only fetches them from where their authors publish them.

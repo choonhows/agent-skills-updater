@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily sync of agent skills
+Description=Daily agent skills update
 
 [Timer]
 OnCalendar=daily
