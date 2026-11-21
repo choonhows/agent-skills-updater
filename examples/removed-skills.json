@@ -1,0 +1,10 @@
+{
+  "policy": "Skills listed here are never refreshed or re-added by tools/update_skills.py, and tools/sync-local.sh uninstalls them once they leave the repository.",
+  "skills": [
+    {
+      "name": "some-skill-you-dropped",
+      "removed_on": "2026-01-01",
+      "reason": "Overlaps another skill and fought it for the same prompts."
+    }
+  ]
+}
