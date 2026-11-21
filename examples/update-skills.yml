@@ -1,0 +1,42 @@
+# Example GitHub Actions workflow for a repository that vendors skills under skills/.
+# Copy this to .github/workflows/update-skills.yml and agent_skills_updater.py to the repo root.
+#
+# Run `python3 agent_skills_updater.py --dir skills --state .skills-updater.json scan`
+# locally once and commit .skills-updater.json, so CI doesn't have to search for sources.
+# Then enable Settings > Actions > General > "Allow GitHub Actions to create and
+# approve pull requests".
+name: Update skills
+
+on:
+  schedule:
+    - cron: "0 2 * * 1" # Mondays 02:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Update skills
+        run: |
+          python3 -I agent_skills_updater.py --dir skills --state .skills-updater.json --no-search \
+            update --yes --report "$RUNNER_TEMP/summary.md"
+          touch "$RUNNER_TEMP/summary.md"
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          branch: auto/skill-updates
+          delete-branch: true
+          title: "Weekly skill updates"
+          commit-message: "chore: update skills from upstream"
+          body-path: ${{ runner.temp }}/summary.md
+          add-paths: |
+            skills/**
+            .skills-updater.json

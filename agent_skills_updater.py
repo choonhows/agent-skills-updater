@@ -53,6 +53,10 @@ SCRIPT_EXT = {".sh", ".bash", ".zsh", ".fish", ".js", ".mjs", ".cjs", ".ts", ".m
 SKIP = {".git", "node_modules", ".DS_Store", "__pycache__"}
 GH_RE = re.compile(r"github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/(?:tree|blob)/[^/\s]+/([^\s'\"#?)]+))?(?:[\s'\"#?)]|$)")
 MATCH_THRESHOLD = 0.6
+MIN_STARS = int(os.environ.get("ASU_MIN_STARS", "100"))  # below this, a guessed source needs `pin`
+MIN_GUESS_MATCH = 0.75  # a guessed source that matches less than this needs `pin` too
+MANAGED = {os.path.realpath(os.path.expanduser(p)) for p in ("~/.claude/skills/synced", "~/.codex/skills/.system")}
+GUESSED = ("directory", "search", "bundle")
 os.environ["GIT_TERMINAL_PROMPT"] = "0"  # never hang on a password prompt for a missing repo
 
 
@@ -198,8 +202,8 @@ def find_skills(roots):
             continue
         for entry in sorted(os.listdir(root)):
             p = os.path.join(root, entry)
-            if not os.path.isdir(p):
-                continue
+            if not os.path.isdir(p) or entry.startswith(".") or os.path.realpath(p) in MANAGED:
+                continue  # hidden folders and app-managed built-ins (Claude's synced skills, Codex's .system)
             candidates = [p]
             if not os.path.isfile(os.path.join(p, "SKILL.md")):
                 # a bundle folder holding several skills (e.g. a cloned skills repo)
@@ -301,6 +305,18 @@ class Repos:
             if s > score or (s == score and best and len(rel) < len(best)):
                 best, score = rel, s
         return best, score
+
+    def stars(self, repo):
+        """GitHub stars (forks count as 0), cached; -1 if unknown."""
+        if repo not in self.meta:
+            got = stars_for([repo])
+            if repo in got:
+                self.meta[repo] = {"stars": max(got[repo], 0), "fork": got[repo] < 0, "parent": None}
+            else:
+                info = github_api(f"repos/{repo}") or {}
+                self.meta[repo] = {"stars": 0 if info.get("fork") else info.get("stargazers_count", -1),
+                                   "fork": info.get("fork", False), "parent": None}
+        return self.meta[repo]["stars"]
 
     def repo_info(self, repo):
         if repo not in self.meta:
@@ -470,7 +486,7 @@ def resolve_all(skills, state, repos, use_search=True, refresh=False):
     def accept(real, repo, path, score, how):
         entry = state.get(real) or {}
         entry.update({"name": skills[real]["name"], "repo": repo, "path": path, "how": how,
-                      "confidence": round(score, 3)})
+                      "confidence": round(score, 3), "stars": repos.stars(repo)})
         entry.setdefault("installed_hash", None)
         state.set(real, entry)
         if repo not in known_repos:
@@ -508,15 +524,17 @@ def resolve_all(skills, state, repos, use_search=True, refresh=False):
             unresolved.append(real)
 
     # skills often come in bundles: try repositories we already know first
+    # (the most reputable repository that has the skill wins, so a mirror can't beat its original)
     still = []
     for real in unresolved:
         name = skills[real]["name"]
         hit = None
-        for repo in known_repos:
+        for repo in sorted(known_repos, key=repos.stars, reverse=True):
             if name in repos.index(repo):
                 path, score = repos.best_match(repo, name, real)
-                if path and score >= MATCH_THRESHOLD and (not hit or score > hit[2]):
+                if path and score >= MATCH_THRESHOLD:
                     hit = (repo, path, score)
+                    break
         if hit:
             accept(real, hit[0], hit[1], hit[2], "bundle")
         else:
@@ -632,6 +650,8 @@ def assess(skills, state, repos, names=None):
             r["status"] = "git"
         elif not e.get("repo"):
             r["status"] = "unknown"
+        elif e.get("how") in GUESSED and (e.get("stars", -1) < MIN_STARS or e.get("confidence", 0) < MIN_GUESS_MATCH):
+            r["status"] = "unverified"  # a guessed source with little reputation: never update it blind
         else:
             path, commit = repos.checkout(e["repo"])
             up = os.path.join(path, e["path"]) if path else None
@@ -681,7 +701,7 @@ def apply_update(r, backup_root):
 
 LABEL = {"current": "up to date", "update": "update available", "differs": "differs from upstream",
          "edited": "edited locally", "unknown": "source unknown", "git": "git checkout",
-         "ignored": "ignored", "missing-upstream": "gone upstream"}
+         "ignored": "ignored", "missing-upstream": "gone upstream", "unverified": "unverified source"}
 
 
 def summarize(results, markdown=False):
@@ -708,6 +728,10 @@ def summarize(results, markdown=False):
         lines += ["", "Scripts that would be added or changed (read before updating):" if not markdown
                   else "### Review first: new or changed scripts", ""]
         lines += [f"  {n}/{f}" if not markdown else f"- `{n}/{f}`" for n, f in scripts]
+    unverified = [f"{r['name']} ({r['entry']['repo']})" for r in results if r["status"] == "unverified"]
+    if unverified:
+        lines += ["", f"Unverified sources ({len(unverified)}), not updated until you confirm with "
+                  f"`pin NAME OWNER/REPO`: " + ", ".join(unverified)]
     unknown = [r["name"] for r in results if r["status"] == "unknown"]
     if unknown:
         lines += ["", f"Source unknown ({len(unknown)}): " + ", ".join(unknown)]
@@ -731,6 +755,8 @@ def cmd_scan(args, skills, state, repos):
         else:
             src = "unknown"
         flag = "  (ignored)" if e.get("ignored") else ""
+        if e.get("how") in GUESSED and (e.get("stars", -1) < MIN_STARS or e.get("confidence", 0) < MIN_GUESS_MATCH) and not e.get("ignored"):
+            flag += f"  (unverified: {max(e.get('stars', 0), 0)} stars, {e.get('confidence', 0):.0%} match; confirm with pin)"
         print(f"{info['name']:<36} {src}{flag}")
     known = sum(1 for r in skills if (state.get(r) or {}).get("repo") or (state.get(r) or {}).get("how") == "git")
     print(f"\n{len(skills)} skills, {known} with a known source")
